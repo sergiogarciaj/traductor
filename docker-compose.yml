@@ -1,0 +1,23 @@
+version: "3.9"
+services:
+  traductor-srt:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: traductor-srt:latest
+    container_name: traductor-srt
+    ports:
+      - "5000:5000"
+    environment:
+      # ⚠️ NO pongas tu clave en el compose; usa un archivo .env
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      HOST: 0.0.0.0
+      PORT: 5000
+      WORKERS: 2
+      THREADS: 4
+      TIMEOUT: 600
+    restart: unless-stopped
+    # Si quieres logs afuera del contenedor:
+    # volumes:
+    #   - ./logs:/app/logs
