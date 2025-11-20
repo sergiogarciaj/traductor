@@ -3,6 +3,8 @@ import io
 import re
 import queue
 import uuid
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from flask import Flask, request, send_file, render_template_string, jsonify, Response
 from openai import OpenAI
@@ -11,6 +13,9 @@ from openai import OpenAI
 # Config básica
 # ========================
 app = Flask(__name__)
+
+# Pool de threads para paralelización
+executor = ThreadPoolExecutor(max_workers=4)
 
 # Sistema de logs con sesión
 current_session_logs = []
@@ -709,6 +714,51 @@ def build_global_summary(client, model, full_text, target_lang):
     )
     return resp.choices[0].message.content.strip()
 
+def translate_chunks_parallel(client, model, chunks, target_lang, global_summary=None):
+    """
+    Traduce múltiples chunks en paralelo usando threads.
+    Retorna lista de (index, translated_text) tuplas.
+    """
+    def translate_single_chunk(index, chunk_blocks):
+        """Traduce un único chunk."""
+        try:
+            translated_text = translate_chunk(
+                client, model, chunk_blocks, target_lang, 
+                global_summary=global_summary, 
+                prev_glossary=None
+            )
+            return (index, translated_text, None)
+        except Exception as e:
+            add_log(f"⚠️ Error traduciendo chunk {index}: {str(e)}")
+            return (index, None, str(e))
+    
+    # Limitar a 4 requests paralelos para no saturar API
+    max_parallel = min(4, len(chunks))
+    futures = []
+    
+    # Enviar todos los chunks a traducir en paralelo
+    for i, chunk_blocks in enumerate(chunks, 1):
+        future = executor.submit(translate_single_chunk, i, chunk_blocks)
+        futures.append(future)
+    
+    # Recolectar resultados manteniendo orden
+    results = []
+    completed = 0
+    for future in futures:
+        index, translated_text, error = future.result()
+        completed += 1
+        if not error:
+            results.append((index, translated_text))
+            add_log(f"✅ Chunk {index} traducido")
+        else:
+            add_log(f"❌ Chunk {index} falló: {error}")
+        
+        # Actualizar progreso
+        progress = 50 + int((completed / len(chunks)) * 40)
+        update_progress(progress)
+    
+    return results
+
 def translate_srt_with_context(srt_text, client, model, target_lang="español", strategy="context"):
     blocks = parse_srt(srt_text)
     if not blocks:
@@ -719,44 +769,60 @@ def translate_srt_with_context(srt_text, client, model, target_lang="español", 
     add_log(f"🤖 Modelo: {model}")
     add_log(f"⚙️ Estrategia: {strategy}")
 
-    # Estrategia 1: contexto global
+    # Estrategia 1: contexto global (CON PARALELIZACIÓN)
     if strategy == "context":
         update_progress(15, "Generando resumen de contexto…")
         add_log("📝 Generando resumen de contexto...")
         summary = build_global_summary(client, model, srt_text, target_lang)
         chunks = chunk_blocks(blocks, max_chars=12000)
-        translated_blocks = []
-        prev_glossary = None
         total = len(chunks)
         add_log(f"📦 Se dividió en {total} chunks")
-        for i, ch in enumerate(chunks, 1):
-            # Progreso: 20% resumen + (i/total * 75%) traducción = 20 a 95%
-            progress = 20 + int((i / total) * 75)
-            add_log(f"🔄 Traduciendo chunk {i}/{total}… ({len(ch)} subtítulos)")
-            update_progress(progress)
-            translated_text = translate_chunk(client, model, ch, target_lang, global_summary=summary, prev_glossary=prev_glossary)
-            tmp = merge_translated_text_to_blocks(translated_text, ch)
-            # Memoria simple para siguiente chunk
-            prev_glossary = (prev_glossary or "") + "\n" + "\n".join([b["text"] for b in tmp[:2]])[:600]
-            translated_blocks.extend(tmp)
+        add_log(f"⚡ Iniciando traducción paralela de {total} chunks...")
+        
+        # Traducir chunks en paralelo
+        results = translate_chunks_parallel(client, model, chunks, target_lang, global_summary=summary)
+        
+        # Procesar resultados en orden
+        translated_blocks = []
+        for chunk_idx, chunk_blocks in enumerate(chunks, 1):
+            # Buscar resultado para este chunk
+            translated_text = None
+            for idx, txt in results:
+                if idx == chunk_idx:
+                    translated_text = txt
+                    break
+            
+            if translated_text:
+                tmp = merge_translated_text_to_blocks(translated_text, chunk_blocks)
+                translated_blocks.extend(tmp)
+        
         update_progress(95, "Finalizando…")
         return render_srt(translated_blocks)
 
-    # Estrategia 2: por bloques (ahorra tokens)
+    # Estrategia 2: por bloques (CON PARALELIZACIÓN)
     elif strategy == "chunks":
         chunks = chunk_blocks(blocks, max_chars=6000)
-        translated_blocks = []
-        prev_glossary = None
         total = len(chunks)
-        for i, ch in enumerate(chunks, 1):
-            # Progreso: (i/total * 90%) = 0% a 90%
-            progress = int((i / total) * 90)
-            add_log(f"🔄 Traduciendo chunk {i}/{total}… ({len(ch)} subtítulos)")
-            update_progress(progress)
-            translated_text = translate_chunk(client, model, ch, target_lang, global_summary=None, prev_glossary=prev_glossary)
-            tmp = merge_translated_text_to_blocks(translated_text, ch)
-            prev_glossary = (prev_glossary or "") + "\n" + "\n".join([b["text"] for b in tmp[:2]])[:400]
-            translated_blocks.extend(tmp)
+        add_log(f"📦 Se dividió en {total} chunks")
+        add_log(f"⚡ Iniciando traducción paralela de {total} chunks...")
+        
+        # Traducir chunks en paralelo
+        results = translate_chunks_parallel(client, model, chunks, target_lang, global_summary=None)
+        
+        # Procesar resultados en orden
+        translated_blocks = []
+        for chunk_idx, chunk_blocks in enumerate(chunks, 1):
+            # Buscar resultado para este chunk
+            translated_text = None
+            for idx, txt in results:
+                if idx == chunk_idx:
+                    translated_text = txt
+                    break
+            
+            if translated_text:
+                tmp = merge_translated_text_to_blocks(translated_text, chunk_blocks)
+                translated_blocks.extend(tmp)
+        
         update_progress(95, "Finalizando…")
         return render_srt(translated_blocks)
 
