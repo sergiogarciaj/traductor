@@ -25,13 +25,16 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copia la app (tu app.py ya parcheado)
 COPY app.py /app/
 
+# Crea carpeta para traducciones
+RUN mkdir -p /app/traducciones && chown -R appuser:appuser /app/traducciones
+
 # Ajustes Gunicorn por defecto (puedes override con env)
 ENV HOST=0.0.0.0 \
     PORT=5000 \
-    WORKERS=2 \
+    WORKERS=1 \
     THREADS=4 \
     TIMEOUT=600 \
-    OPENAI_MODEL=gpt-4o-mini
+    OPENAI_MODEL=gpt-3.5-turbo
 
 # Puerto de la app
 EXPOSE 5000
@@ -44,4 +47,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD curl -fsS http://127.0.0.1:5000/ || exit 1
 
 # Ejecuta con Gunicorn (más robusto que flask dev server)
-CMD ["bash", "-lc", "exec gunicorn app:app -b ${HOST}:${PORT} --workers ${WORKERS} --threads ${THREADS} --timeout ${TIMEOUT}"]
+CMD gunicorn app:app -b 0.0.0.0:5000 --workers 1 --threads 4 --timeout 600
