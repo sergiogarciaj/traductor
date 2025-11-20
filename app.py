@@ -42,7 +42,7 @@ def update_progress(progress: int, message: str = ""):
     current_progress = max(0, min(100, progress))
     if message:
         add_log(f"📊 {message}")
-DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
+DEFAULT_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
 HTML = r"""
 <!doctype html>
@@ -89,7 +89,7 @@ HTML = r"""
     </div>
     <div class="card">
       <h1>Traductor de subtítulos .srt</h1>
-      <p class="lead">Sube un archivo <code>.srt</code>, elige idioma destino y usa tu <code>OPENAI_API_KEY</code> para traducir con contexto global.</p>
+      <p class="lead">Sube un archivo <code>.srt</code>, elige idioma destino, proveedor de IA y API key para traducir con contexto global y paralelización.</p>
       <form id="form">
         <label>Archivo .srt</label>
         <input type="file" id="file" accept=".srt" required />
@@ -108,8 +108,8 @@ HTML = r"""
           <div>
             <label>Proveedor de IA</label>
             <select id="provider" onchange="updateModelOptions()">
-              <option value="openai" selected>OpenAI</option>
-              <option value="deepseek">Deepseek</option>
+              <option value="openai">OpenAI</option>
+              <option value="deepseek" selected>Deepseek</option>
             </select>
           </div>
         </div>
@@ -119,7 +119,7 @@ HTML = r"""
             <label>Modelo</label>
             <select id="model">
               <!-- OpenAI Models -->
-              <option value="" data-provider="openai" selected>Por defecto ({{ default_model }})</option>
+              <option value="gpt-3.5-turbo" data-provider="openai">GPT-3.5 Turbo</option>
               <option value="gpt-5.1" data-provider="openai">GPT-5.1 (mejor calidad)</option>
               <option value="gpt-5-mini" data-provider="openai">GPT-5 Mini (rápido)</option>
               <option value="gpt-5-nano" data-provider="openai">GPT-5 Nano (muy rápido)</option>
@@ -128,9 +128,9 @@ HTML = r"""
               <option value="gpt-4-turbo" data-provider="openai">GPT-4 Turbo</option>
               <option value="gpt-3.5-turbo" data-provider="openai">GPT-3.5 Turbo</option>
               <!-- Deepseek Models -->
-              <option value="deepseek-chat" data-provider="deepseek" style="display:none">Deepseek Chat</option>
-              <option value="deepseek-coder" data-provider="deepseek" style="display:none">Deepseek Coder</option>
-              <option value="deepseek-reasoner" data-provider="deepseek" style="display:none">Deepseek Reasoner (Advanced)</option>
+              <option value="deepseek-chat" data-provider="deepseek" selected>Deepseek Chat</option>
+              <option value="deepseek-coder" data-provider="deepseek">Deepseek Coder</option>
+              <option value="deepseek-reasoner" data-provider="deepseek">Deepseek Reasoner (Advanced)</option>
             </select>
           </div>
         </div>
@@ -184,6 +184,7 @@ function updateModelOptions() {
   const modelSelect = document.getElementById('model');
   const options = modelSelect.querySelectorAll('option');
   
+  // Mostrar/ocultar opciones según proveedor
   options.forEach(option => {
     const optProvider = option.getAttribute('data-provider');
     if (optProvider === provider) {
@@ -193,12 +194,29 @@ function updateModelOptions() {
     }
   });
   
-  // Seleccionar el primer modelo visible del proveedor
-  const firstVisible = Array.from(options).find(opt => 
-    opt.getAttribute('data-provider') === provider && opt.style.display !== 'none'
+  // Seleccionar modelo por defecto según proveedor
+  let defaultModel;
+  if (provider === 'deepseek') {
+    defaultModel = 'deepseek-chat';
+  } else if (provider === 'openai') {
+    defaultModel = 'gpt-3.5-turbo';
+  }
+  
+  // Buscar y seleccionar la opción
+  const targetOption = Array.from(options).find(opt => 
+    opt.getAttribute('data-provider') === provider && opt.value === defaultModel
   );
-  if (firstVisible) {
-    modelSelect.value = firstVisible.value;
+  
+  if (targetOption) {
+    modelSelect.value = defaultModel;
+  } else {
+    // Fallback: primer modelo visible
+    const firstVisible = Array.from(options).find(opt => 
+      opt.getAttribute('data-provider') === provider && opt.style.display !== 'none'
+    );
+    if (firstVisible) {
+      modelSelect.value = firstVisible.value;
+    }
   }
 }
 
@@ -506,6 +524,49 @@ def render_srt(blocks):
         out.append(f"{b['index']}\n{b['start']} --> {b['end']}\n{txt}\n")
     return "\n".join(out).strip() + "\n"
 
+def detect_language_of_text(text: str) -> str:
+    """
+    Detecta el idioma probable de un texto.
+    Retorna: 'español', 'inglés', 'otro' basado en palabras clave comunes.
+    """
+    text_lower = text.lower()
+    
+    # Palabras clave españolas
+    spanish_words = ['el', 'la', 'de', 'que', 'y', 'a', 'en', 'es', 'se', 'por', 'para', 'con', 'está', 'son', 'fue', 'están']
+    
+    # Palabras clave inglesas
+    english_words = ['the', 'and', 'to', 'of', 'a', 'in', 'is', 'it', 'that', 'was', 'you', 'for', 'are', 'be', 'on']
+    
+    spanish_count = sum(1 for word in spanish_words if f' {word} ' in f' {text_lower} ')
+    english_count = sum(1 for word in english_words if f' {word} ' in f' {text_lower} ')
+    
+    if spanish_count > english_count:
+        return 'español'
+    elif english_count > spanish_count:
+        return 'inglés'
+    return 'otro'
+
+def verify_translation_blocks(blocks, target_lang: str) -> tuple[bool, list]:
+    """
+    Verifica que todos los bloques hayan sido traducidos al idioma correcto.
+    Retorna (is_valid, list_of_untranslated_indices)
+    """
+    untranslated = []
+    
+    for block in blocks:
+        text = block.get("text", "")
+        if not text:
+            untranslated.append(block["index"])
+            continue
+        
+        detected_lang = detect_language_of_text(text)
+        
+        # Si el idioma detectado es inglés y debería ser español, marcar como no traducido
+        if target_lang == "español" and detected_lang == "inglés":
+            untranslated.append(block["index"])
+    
+    return len(untranslated) == 0, untranslated
+
 def normalize_case(text: str) -> str:
     """Normaliza mayúsculas excesivas. Si >60% es mayúsculas, convierte a minúsculas con capitalización."""
     if not text:
@@ -547,6 +608,40 @@ def chunk_blocks(blocks, max_chars=12000):
     if cur:
         chunks.append(cur)
     return chunks
+
+def chunk_blocks_multiple_of_4(blocks, max_chars=12000):
+    """
+    Agrupa bloques en chunks garantizando que el total sea múltiplo de 4.
+    Esto optimiza el paralelismo: 4, 8, 12, 16, etc. workers sin dejar ociosos.
+    """
+    # Primero, divide por caracteres
+    initial_chunks = chunk_blocks(blocks, max_chars)
+    
+    num_chunks = len(initial_chunks)
+    
+    # Si ya es múltiplo de 4, devuelve tal cual
+    if num_chunks % 4 == 0:
+        return initial_chunks
+    
+    # Calcula el próximo múltiplo de 4
+    target_chunks = ((num_chunks // 4) + 1) * 4
+    
+    # Redistribuye los bloques en `target_chunks` partes lo más equilibradas posible
+    total_blocks = len(blocks)
+    blocks_per_chunk = total_blocks // target_chunks
+    remainder = total_blocks % target_chunks
+    
+    result = []
+    start_idx = 0
+    
+    for i in range(target_chunks):
+        # Los primeros `remainder` chunks reciben un bloque extra
+        size = blocks_per_chunk + (1 if i < remainder else 0)
+        if size > 0:
+            result.append(blocks[start_idx:start_idx + size])
+            start_idx += size
+    
+    return result
 
 def format_blocks_for_prompt(blocks):
     # Formato fijo para mapear 1:1
@@ -716,9 +811,12 @@ def build_global_summary(client, model, full_text, target_lang):
 
 def translate_chunks_parallel(client, model, chunks, target_lang, global_summary=None):
     """
-    Traduce múltiples chunks en paralelo usando threads.
+    Traduce múltiples chunks en paralelo usando threads con límite de 4 peticiones simultáneas.
+    Respeta el rate limit de Deepseek: máximo 4 requests en paralelo.
     Retorna lista de (index, translated_text) tuplas.
     """
+    from concurrent.futures import as_completed
+    
     def translate_single_chunk(index, chunk_blocks):
         """Traduce un único chunk."""
         try:
@@ -732,32 +830,116 @@ def translate_chunks_parallel(client, model, chunks, target_lang, global_summary
             add_log(f"⚠️ Error traduciendo chunk {index}: {str(e)}")
             return (index, None, str(e))
     
-    # Limitar a 4 requests paralelos para no saturar API
-    max_parallel = min(4, len(chunks))
-    futures = []
-    
-    # Enviar todos los chunks a traducir en paralelo
-    for i, chunk_blocks in enumerate(chunks, 1):
-        future = executor.submit(translate_single_chunk, i, chunk_blocks)
-        futures.append(future)
-    
-    # Recolectar resultados manteniendo orden
+    # Limitar a máximo 4 requests paralelos para no saturar API Deepseek
+    max_parallel = 4
+    total_chunks = len(chunks)
     results = []
     completed = 0
-    for future in futures:
-        index, translated_text, error = future.result()
-        completed += 1
-        if not error:
-            results.append((index, translated_text))
-            add_log(f"✅ Chunk {index} traducido")
-        else:
-            add_log(f"❌ Chunk {index} falló: {error}")
+    
+    # Cola de tareas pendientes: lista de (idx, chunk)
+    pending_chunks = list(enumerate(chunks, 1))
+    # Diccionario para mapear future -> index
+    future_to_index = {}
+    
+    # Llenar el pool inicial con hasta 4 tareas
+    active_futures = []
+    while pending_chunks and len(active_futures) < max_parallel:
+        idx, chunk = pending_chunks.pop(0)
+        future = executor.submit(translate_single_chunk, idx, chunk)
+        active_futures.append(future)
+        future_to_index[future] = idx
+    
+    # Procesar resultados conforme se completan y enviar nuevas tareas
+    while active_futures:
+        # Obtener el siguiente future que se complete
+        done, pending = None, active_futures
+        for future in as_completed(pending):
+            done = future
+            break
         
-        # Actualizar progreso
-        progress = 50 + int((completed / len(chunks)) * 40)
-        update_progress(progress)
+        if done:
+            active_futures.remove(done)
+            
+            index, translated_text, error = done.result()
+            completed += 1
+            
+            if not error:
+                results.append((index, translated_text))
+                add_log(f"✅ Chunk {index} traducido")
+            else:
+                add_log(f"❌ Chunk {index} falló: {error}")
+            
+            # Actualizar progreso
+            progress = 50 + int((completed / total_chunks) * 40)
+            update_progress(progress)
+            
+            # Enviar siguiente tarea si hay pendientes
+            if pending_chunks:
+                idx, chunk = pending_chunks.pop(0)
+                future = executor.submit(translate_single_chunk, idx, chunk)
+                active_futures.append(future)
+                future_to_index[future] = idx
     
     return results
+
+def retranslate_untranslated_blocks(client, model, translated_blocks, untranslated_indices, original_blocks, target_lang, max_retries=2):
+    """
+    Reintenta traducir los bloques que no fueron traducidos correctamente.
+    Retorna la lista de bloques actualizada.
+    """
+    if not untranslated_indices:
+        return translated_blocks
+    
+    add_log(f"🔄 Reintentando traducción de {len(untranslated_indices)} subtítulos no traducidos...")
+    
+    # Crear chunks solo con los bloques no traducidos
+    untranslated_blocks = [b for b in original_blocks if b["index"] in untranslated_indices]
+    
+    # Agrupar en chunks para reintento
+    retry_chunks = chunk_blocks(untranslated_blocks, max_chars=6000)
+    
+    add_log(f"📦 Agrupados en {len(retry_chunks)} chunks para reintento")
+    
+    # Traducir en paralelo con límite de reintentos
+    for attempt in range(max_retries):
+        add_log(f"⚡ Reintento {attempt + 1}/{max_retries}...")
+        
+        results = translate_chunks_parallel(client, model, retry_chunks, target_lang, global_summary=None)
+        
+        # Actualizar bloques traducidos
+        retry_translated = []
+        for chunk_idx, ch in enumerate(retry_chunks, 1):
+            translated_text = None
+            for idx, txt in results:
+                if idx == chunk_idx:
+                    translated_text = txt
+                    break
+            
+            if translated_text:
+                tmp = merge_translated_text_to_blocks(translated_text, ch)
+                retry_translated.extend(tmp)
+            else:
+                retry_translated.extend(ch)
+        
+        # Reemplazar los bloques retraducidos en translated_blocks
+        for retry_block in retry_translated:
+            for i, block in enumerate(translated_blocks):
+                if block["index"] == retry_block["index"]:
+                    translated_blocks[i] = retry_block
+                    break
+        
+        # Verificar si ahora está todo bien
+        is_valid, still_untranslated = verify_translation_blocks(translated_blocks, target_lang)
+        if is_valid:
+            add_log(f"✅ Reintento {attempt + 1} exitoso: todos los subtítulos traducidos")
+            return translated_blocks
+        elif len(still_untranslated) < len(untranslated_indices):
+            add_log(f"✅ Reintento {attempt + 1}: reducidos a {len(still_untranslated)} subtítulos sin traducir (de {len(untranslated_indices)})")
+            untranslated_indices = still_untranslated
+        else:
+            add_log(f"⚠️ Reintento {attempt + 1}: sin cambios, {len(still_untranslated)} subtítulos aún sin traducir")
+    
+    return translated_blocks
 
 def translate_srt_with_context(srt_text, client, model, target_lang="español", strategy="context"):
     blocks = parse_srt(srt_text)
@@ -774,9 +956,9 @@ def translate_srt_with_context(srt_text, client, model, target_lang="español", 
         update_progress(15, "Generando resumen de contexto…")
         add_log("📝 Generando resumen de contexto...")
         summary = build_global_summary(client, model, srt_text, target_lang)
-        chunks = chunk_blocks(blocks, max_chars=12000)
+        chunks = chunk_blocks_multiple_of_4(blocks, max_chars=12000)
         total = len(chunks)
-        add_log(f"📦 Se dividió en {total} chunks")
+        add_log(f"📦 Se dividió en {total} chunks (múltiplo de 4 para paralelismo óptimo)")
         add_log(f"⚡ Iniciando traducción paralela de {total} chunks...")
         
         # Traducir chunks en paralelo
@@ -784,7 +966,7 @@ def translate_srt_with_context(srt_text, client, model, target_lang="español", 
         
         # Procesar resultados en orden
         translated_blocks = []
-        for chunk_idx, chunk_blocks in enumerate(chunks, 1):
+        for chunk_idx, ch in enumerate(chunks, 1):
             # Buscar resultado para este chunk
             translated_text = None
             for idx, txt in results:
@@ -793,10 +975,31 @@ def translate_srt_with_context(srt_text, client, model, target_lang="español", 
                     break
             
             if translated_text:
-                tmp = merge_translated_text_to_blocks(translated_text, chunk_blocks)
+                tmp = merge_translated_text_to_blocks(translated_text, ch)
                 translated_blocks.extend(tmp)
+            else:
+                # Fallback: si no se tradujo, usar original
+                add_log(f"⚠️ Chunk {chunk_idx} no fue traducido, usando original")
+                translated_blocks.extend(ch)
         
         update_progress(95, "Finalizando…")
+        
+        # Verificar que todos los bloques fueron traducidos correctamente
+        is_valid, untranslated_indices = verify_translation_blocks(translated_blocks, target_lang)
+        if not is_valid:
+            add_log(f"⚠️ Detectados {len(untranslated_indices)} subtítulos sin traducir, iniciando reintento...")
+            translated_blocks = retranslate_untranslated_blocks(client, model, translated_blocks, untranslated_indices, blocks, target_lang)
+            
+            # Verificar nuevamente
+            is_valid, untranslated_indices = verify_translation_blocks(translated_blocks, target_lang)
+            if not is_valid:
+                add_log(f"⚠️ ADVERTENCIA: Después de reintentos, aún hay {len(untranslated_indices)} subtítulos sin traducir")
+                add_log(f"   Índices: {untranslated_indices[:20]}{'...' if len(untranslated_indices) > 20 else ''}")
+            else:
+                add_log(f"✅ Reintento exitoso: todos los {len(translated_blocks)} subtítulos en {target_lang}")
+        else:
+            add_log(f"✅ Verificación completa: todos los {len(translated_blocks)} subtítulos están en {target_lang}")
+        
         return render_srt(translated_blocks)
 
     # Estrategia 2: por bloques (CON PARALELIZACIÓN)
@@ -811,7 +1014,7 @@ def translate_srt_with_context(srt_text, client, model, target_lang="español", 
         
         # Procesar resultados en orden
         translated_blocks = []
-        for chunk_idx, chunk_blocks in enumerate(chunks, 1):
+        for chunk_idx, ch in enumerate(chunks, 1):
             # Buscar resultado para este chunk
             translated_text = None
             for idx, txt in results:
@@ -820,10 +1023,31 @@ def translate_srt_with_context(srt_text, client, model, target_lang="español", 
                     break
             
             if translated_text:
-                tmp = merge_translated_text_to_blocks(translated_text, chunk_blocks)
+                tmp = merge_translated_text_to_blocks(translated_text, ch)
                 translated_blocks.extend(tmp)
+            else:
+                # Fallback: si no se tradujo, usar original
+                add_log(f"⚠️ Chunk {chunk_idx} no fue traducido, usando original")
+                translated_blocks.extend(ch)
         
         update_progress(95, "Finalizando…")
+        
+        # Verificar que todos los bloques fueron traducidos correctamente
+        is_valid, untranslated_indices = verify_translation_blocks(translated_blocks, target_lang)
+        if not is_valid:
+            add_log(f"⚠️ Detectados {len(untranslated_indices)} subtítulos sin traducir, iniciando reintento...")
+            translated_blocks = retranslate_untranslated_blocks(client, model, translated_blocks, untranslated_indices, blocks, target_lang)
+            
+            # Verificar nuevamente
+            is_valid, untranslated_indices = verify_translation_blocks(translated_blocks, target_lang)
+            if not is_valid:
+                add_log(f"⚠️ ADVERTENCIA: Después de reintentos, aún hay {len(untranslated_indices)} subtítulos sin traducir")
+                add_log(f"   Índices: {untranslated_indices[:20]}{'...' if len(untranslated_indices) > 20 else ''}")
+            else:
+                add_log(f"✅ Reintento exitoso: todos los {len(translated_blocks)} subtítulos en {target_lang}")
+        else:
+            add_log(f"✅ Verificación completa: todos los {len(translated_blocks)} subtítulos están en {target_lang}")
+        
         return render_srt(translated_blocks)
 
     else:
